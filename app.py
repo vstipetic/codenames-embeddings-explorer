@@ -16,21 +16,31 @@ from Scripts.find_best_word import (
     WordCategory,
     find_best_hints,
     load_embeddings,
+    load_faiss_index,
+    load_hint_words_order,
 )
 
 
 @st.cache_resource
 def load_all_embeddings():
-    """Load embeddings (cached across reruns)."""
+    """Load embeddings and FAISS index (cached across reruns)."""
     hint_path = Path("Storage/hint_embeddings.pkl")
     codenames_path = Path("Storage/codenames_embeddings.pkl")
+    faiss_index_path = Path("Storage/hint_embeddings_faiss.index")
+    words_order_path = Path("Storage/hint_words_order.pkl")
 
-    if not hint_path.exists() or not codenames_path.exists():
-        return None, None
+    # Check all required files exist
+    required_files = [hint_path, codenames_path, faiss_index_path, words_order_path]
+    missing = [str(f) for f in required_files if not f.exists()]
+    if missing:
+        return None, None, None, None, missing
 
     hint_embeddings = load_embeddings(str(hint_path))
     codenames_embeddings = load_embeddings(str(codenames_path))
-    return hint_embeddings, codenames_embeddings
+    hint_index = load_faiss_index(str(faiss_index_path))
+    hint_words_order = load_hint_words_order(str(words_order_path))
+
+    return hint_embeddings, codenames_embeddings, hint_index, hint_words_order, []
 
 
 def load_codenames_words() -> list[str]:
@@ -143,14 +153,16 @@ def main():
     st.title("Codenames Hint Generator")
 
     # Load resources
-    hint_embeddings, codenames_embeddings = load_all_embeddings()
+    result = load_all_embeddings()
+    hint_embeddings, codenames_embeddings, hint_index, hint_words_order, missing_files = result
     codenames_words = load_codenames_words()
 
-    # Check if embeddings exist
-    if hint_embeddings is None or codenames_embeddings is None:
+    # Check if all required files exist
+    if missing_files:
         st.error(
-            "Embeddings not found! Please run the embedding script first:\n\n"
-            "```bash\nuv run python Scripts/construct_embeddings.py\n```"
+            "Required files not found! Please run the embedding script first:\n\n"
+            "```bash\nuv run python Scripts/construct_embeddings.py\n```\n\n"
+            f"Missing files:\n" + "\n".join(f"- {f}" for f in missing_files)
         )
         return
 
@@ -184,6 +196,9 @@ def main():
         st.markdown("- **Beige**: Neutral")
         st.markdown("- **Black**: Trap (Assassin)")
 
+        st.markdown("---")
+        st.caption(f"Vocabulary: {len(hint_embeddings):,} words")
+
     # Main content
     if "board" not in st.session_state:
         st.info("Click 'Generate New Board' to start!")
@@ -205,6 +220,8 @@ def main():
             board_words=board,
             hint_embeddings=hint_embeddings,
             board_embeddings=codenames_embeddings,
+            hint_index=hint_index,
+            hint_words_order=hint_words_order,
             cliff_threshold=cliff_threshold,
             top_k=10,
         )
