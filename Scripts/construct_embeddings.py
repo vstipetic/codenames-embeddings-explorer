@@ -10,35 +10,36 @@ Generates:
     - Word order file for FAISS ID mapping
 """
 
+import csv
 import os
 import pickle
 from pathlib import Path
 
+import faiss
 import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
-
-try:
-    import faiss
-
-    FAISS_AVAILABLE = True
-except ImportError:
-    FAISS_AVAILABLE = False
-    print("Warning: FAISS not installed. FAISS index will not be generated.")
+from tqdm import tqdm
 
 
 def load_words_from_file(filepath: str) -> list[str]:
-    """Load words from a text file, one word per line."""
+    """Load words from a text file, one word per line, normalized to lowercase."""
     with open(filepath, "r", encoding="utf-8") as f:
-        words = [line.strip() for line in f if line.strip()]
-    return words
+        return [line.strip().lower() for line in f if line.strip()]
+
+
+def load_words_from_csv(filepath: str, column: str = "word") -> list[str]:
+    """Load words from a CSV file, extracting specified column, normalized to lowercase."""
+    with open(filepath, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return [row[column].strip().lower() for row in reader if row[column].strip()]
 
 
 def get_embeddings_batch(
     client: OpenAI,
     words: list[str],
     model: str = "text-embedding-3-small",
-    batch_size: int = 100,
+    batch_size: int = 1000,
 ) -> dict[str, np.ndarray]:
     """
     Get embeddings for a list of words from OpenAI API.
@@ -48,9 +49,9 @@ def get_embeddings_batch(
     """
     embeddings = {}
 
-    for i in range(0, len(words), batch_size):
+    batch_ranges = range(0, len(words), batch_size)
+    for i in tqdm(batch_ranges, total=(len(words) - 1) // batch_size + 1, desc="Embedding batches"):
         batch = words[i : i + batch_size]
-        print(f"Processing batch {i // batch_size + 1}/{(len(words) - 1) // batch_size + 1}...")
 
         response = client.embeddings.create(input=batch, model=model)
 
@@ -71,6 +72,16 @@ def save_embeddings(embeddings: dict[str, np.ndarray], filepath: str) -> None:
     print(f"Saved {len(embeddings)} embeddings to {filepath}")
 
 
+def save_missing_words(missing_words: list[str], filepath: str) -> None:
+    """Save missing words (failed embeddings) to a text file, one per line."""
+    if not missing_words:
+        return
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("\n".join(missing_words))
+    print(f"Saved {len(missing_words)} missing words to {filepath}")
+
+
 def save_faiss_index(
     embeddings: dict[str, np.ndarray],
     index_path: str,
@@ -84,10 +95,6 @@ def save_faiss_index(
         index_path: Path to save FAISS index
         order_path: Path to save word order (for mapping FAISS IDs back to words)
     """
-    if not FAISS_AVAILABLE:
-        print("FAISS not available, skipping index generation")
-        return
-
     # Get words and embeddings in consistent order
     words = list(embeddings.keys())
     matrix = np.vstack([embeddings[w] for w in words]).astype(np.float32)
@@ -123,16 +130,18 @@ def main():
     client = OpenAI(api_key=api_key)
 
     # Paths
-    hint_words_path = "Data/common_english_words.txt"
+    hint_words_path = "Storage/unigram_freq.csv"
     codenames_words_path = "Data/codenames_words.txt"
     hint_embeddings_path = "Storage/hint_embeddings.pkl"
     codenames_embeddings_path = "Storage/codenames_embeddings.pkl"
     hint_faiss_index_path = "Storage/hint_embeddings_faiss.index"
     hint_words_order_path = "Storage/hint_words_order.pkl"
+    hint_missing_words_path = "Storage/hint_missing_words.txt"
+    codenames_missing_words_path = "Storage/codenames_missing_words.txt"
 
     # Load words
     print("Loading word lists...")
-    hint_words = load_words_from_file(hint_words_path)
+    hint_words = load_words_from_csv(hint_words_path, column="word")
     codenames_words = load_words_from_file(codenames_words_path)
 
     print(f"Loaded {len(hint_words)} hint words")
@@ -142,6 +151,9 @@ def main():
     print("\nGenerating embeddings for hint vocabulary...")
     hint_embeddings = get_embeddings_batch(client, hint_words)
     save_embeddings(hint_embeddings, hint_embeddings_path)
+    print(f"Hint embeddings stored: {len(hint_embeddings)}")
+    hint_missing_words = [w for w in hint_words if w not in hint_embeddings]
+    save_missing_words(hint_missing_words, hint_missing_words_path)
 
     # Generate FAISS index for hint vocabulary (for efficient nearest neighbor search)
     print("\nGenerating FAISS index for hint vocabulary...")
@@ -151,6 +163,9 @@ def main():
     print("\nGenerating embeddings for Codenames words...")
     codenames_embeddings = get_embeddings_batch(client, codenames_words)
     save_embeddings(codenames_embeddings, codenames_embeddings_path)
+    print(f"Codenames embeddings stored: {len(codenames_embeddings)}")
+    codenames_missing_words = [w for w in codenames_words if w not in codenames_embeddings]
+    save_missing_words(codenames_missing_words, codenames_missing_words_path)
 
     print("\nDone!")
 
