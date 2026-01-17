@@ -55,8 +55,7 @@ uv run streamlit run app.py
 
 ### File Organization
 - `Scripts/` contains standalone scripts
-- `Storage/` contains generated data (git-ignored)
-- `Data/` contains input word lists
+- `Storage/` contains input word lists and generated data (git-ignored)
 
 ### Environment Variables
 - `OPENAI_API_KEY`: Required for embedding generation (system variable or .env file)

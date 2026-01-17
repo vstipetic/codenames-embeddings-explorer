@@ -44,8 +44,8 @@ def load_all_embeddings():
 
 
 def load_codenames_words() -> list[str]:
-    """Load Codenames word list from Data folder."""
-    path = Path("Data/codenames_words.txt")
+    """Load Codenames word list from Storage folder."""
+    path = Path("Storage/codename_words.txt")
     if not path.exists():
         return []
     with open(path, "r", encoding="utf-8") as f:
@@ -167,7 +167,7 @@ def main():
         return
 
     if not codenames_words:
-        st.error("Codenames word list not found at Data/codenames_words.txt")
+        st.error("Codenames word list not found at Storage/codename_words.txt")
         return
 
     # Sidebar controls

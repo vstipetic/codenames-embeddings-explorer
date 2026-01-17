@@ -13,6 +13,7 @@ Generates:
 import csv
 import os
 import pickle
+import time
 from pathlib import Path
 
 import faiss
@@ -20,6 +21,9 @@ import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
 from tqdm import tqdm
+
+# Retry configuration
+MAX_RETRIES_PER_BATCH = 5
 
 
 def load_words_from_file(filepath: str) -> list[str]:
@@ -40,25 +44,47 @@ def get_embeddings_batch(
     words: list[str],
     model: str = "text-embedding-3-small",
     batch_size: int = 1000,
+    max_retries: int = MAX_RETRIES_PER_BATCH,
 ) -> dict[str, np.ndarray]:
     """
     Get embeddings for a list of words from OpenAI API.
 
     Batches requests to avoid rate limits.
+    Retries failed batches with exponential backoff.
     Returns dict mapping word -> normalized embedding vector.
     """
     embeddings = {}
 
     batch_ranges = range(0, len(words), batch_size)
-    for i in tqdm(batch_ranges, total=(len(words) - 1) // batch_size + 1, desc="Embedding batches"):
-        batch = words[i : i + batch_size]
+    total_batches = (len(words) - 1) // batch_size + 1
 
-        response = client.embeddings.create(input=batch, model=model)
+    for i in tqdm(batch_ranges, total=total_batches, desc="Embedding batches"):
+        batch = words[i : i + batch_size]
+        batch_num = i // batch_size + 1
+
+        # Retry loop with exponential backoff
+        for attempt in range(max_retries):
+            try:
+                response = client.embeddings.create(input=batch, model=model)
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2**attempt  # 1, 2, 4, 8, 16 seconds
+                    print(f"\nBatch {batch_num}/{total_batches} failed (attempt {attempt + 1}): {e}")
+                    print(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    raise RuntimeError(
+                        f"Batch {batch_num}/{total_batches} failed after {max_retries} attempts: {e}"
+                    )
 
         for word, data in zip(batch, response.data):
             vec = np.array(data.embedding, dtype=np.float32)
-            # Normalize for cosine similarity via dot product
-            vec = vec / np.linalg.norm(vec)
+            # Zero-norm guard: prevent NaN from division by zero
+            norm = np.linalg.norm(vec)
+            if norm == 0:
+                raise ValueError(f"Zero-norm embedding returned for word: '{word}'")
+            vec = vec / norm
             embeddings[word] = vec
 
     return embeddings
@@ -131,7 +157,7 @@ def main():
 
     # Paths
     hint_words_path = "Storage/unigram_freq.csv"
-    codenames_words_path = "Data/codenames_words.txt"
+    codenames_words_path = "Storage/codename_words.txt"
     hint_embeddings_path = "Storage/hint_embeddings.pkl"
     codenames_embeddings_path = "Storage/codenames_embeddings.pkl"
     hint_faiss_index_path = "Storage/hint_embeddings_faiss.index"
