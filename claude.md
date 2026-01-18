@@ -21,8 +21,8 @@ A tool that generates Codenames hints using OpenAI embeddings and cosine similar
 2. Rank hints by number of team words covered
 
 ## Codenames Rules Reference
-- Board: 20 words total
-- Team distribution: 9 team, 8 enemy, 2 neutral, 1 trap (assassin)
+- Board: 25 words total (5x5 grid)
+- Team distribution: 9 team, 8 enemy, 7 neutral, 1 trap (assassin)
 - Hint format: A single word + number (e.g., "BEACH 3")
 - Goal: Team guesses all their words based on hints
 - Trap: If guessed, instant loss

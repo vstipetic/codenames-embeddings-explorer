@@ -174,6 +174,16 @@ def prefilter_hints(
     return np.where(valid_mask)[0]
 
 
+def contains_board_word_substring(hint: str, board_words_lower: set[str]) -> bool:
+    """
+    Check if any board word is a substring of the hint.
+
+    Prevents hints like "BEACHES" when "BEACH" is on the board.
+    """
+    hint_lower = hint.lower()
+    return any(bw in hint_lower for bw in board_words_lower)
+
+
 def evaluate_hint_from_similarities(
     hint_word: str,
     similarities: np.ndarray,
@@ -182,6 +192,10 @@ def evaluate_hint_from_similarities(
 ) -> HintCandidate | None:
     """
     Evaluate a hint given its precomputed similarities to board words.
+
+    Finds the maximum number of consecutive team words that have a valid cliff
+    (gap >= threshold) to the next word. If the cliff to the first non-team word
+    is insufficient, checks for internal cliffs between team words.
     """
     # Get sorted indices (descending by similarity)
     sorted_indices = np.argsort(similarities)[::-1]
@@ -202,35 +216,51 @@ def evaluate_hint_from_similarities(
     if sorted_pairs[0][0].category != WordCategory.TEAM:
         return None
 
-    # Count consecutive team words from top and find cliff
-    team_words: list[str] = []
-    last_team_idx = 0
+    # Collect consecutive team words with their similarities
+    consecutive_team: list[tuple[str, float]] = []
+    first_non_team_idx: int | None = None
 
-    for idx, (bw, _sim) in enumerate(sorted_pairs):
+    for idx, (bw, sim) in enumerate(sorted_pairs):
         if bw.category == WordCategory.TEAM:
-            team_words.append(bw.word)
-            last_team_idx = idx
+            consecutive_team.append((bw.word, sim))
         else:
+            first_non_team_idx = idx
             break
 
-    if not team_words:
+    if not consecutive_team:
         return None
 
-    # Calculate cliff
-    if last_team_idx + 1 < len(sorted_pairs):
-        cliff = sorted_pairs[last_team_idx][1] - sorted_pairs[last_team_idx + 1][1]
-    else:
-        cliff = 1.0
+    # Try to find valid cliff, starting from max coverage and working down
+    for num_words in range(len(consecutive_team), 0, -1):
+        last_team_sim = consecutive_team[num_words - 1][1]
 
-    if cliff < cliff_threshold:
-        return None
+        # Determine the similarity of the next word after our coverage
+        if num_words < len(consecutive_team):
+            # Next word is another team word (internal cliff)
+            next_sim = consecutive_team[num_words][1]
+        elif first_non_team_idx is not None:
+            # Next word is a non-team word
+            next_sim = sorted_pairs[first_non_team_idx][1]
+        else:
+            # No words after our team words - perfect cliff
+            return HintCandidate(
+                hint_word=hint_word,
+                num_words=num_words,
+                cliff_size=1.0,
+                team_words=[w for w, _ in consecutive_team[:num_words]],
+            )
 
-    return HintCandidate(
-        hint_word=hint_word,
-        num_words=len(team_words),
-        cliff_size=cliff,
-        team_words=team_words,
-    )
+        cliff = last_team_sim - next_sim
+        if cliff >= cliff_threshold:
+            return HintCandidate(
+                hint_word=hint_word,
+                num_words=num_words,
+                cliff_size=cliff,
+                team_words=[w for w, _ in consecutive_team[:num_words]],
+            )
+
+    # No valid cliff found at any position
+    return None
 
 
 def get_faiss_candidates(
@@ -268,6 +298,7 @@ def find_best_hints(
     cliff_threshold: float = 0.1,
     top_k: int = 5,
     top_k_per_team: int = 5000,
+    max_vocab_size: int | None = None,
     verbose: bool = False,
 ) -> list[HintCandidate]:
     """
@@ -278,10 +309,11 @@ def find_best_hints(
         hint_embeddings: Dict of hint word -> embedding
         board_embeddings: Dict of board word -> embedding
         hint_index: FAISS index for candidate filtering
-        hint_words_order: Word list matching FAISS index order
+        hint_words_order: Word list matching FAISS index order (sorted by frequency)
         cliff_threshold: Minimum similarity gap required
         top_k: Number of top hints to return
         top_k_per_team: Number of candidates to retrieve per team word from FAISS
+        max_vocab_size: Limit hints to top N most frequent words (None = use all)
         verbose: If True, print timing information
 
     Returns:
@@ -289,12 +321,14 @@ def find_best_hints(
     """
     timings: list[str] = []
 
-    # Step 1: Build excluded words set
+    # Step 1: Build excluded words set and substring filter set
     with timer("build_excluded_set") as t:
         excluded_words = set()
+        board_words_lower = set()
         for bw in board_words:
             excluded_words.add(bw.word.lower())
             excluded_words.add(bw.word.upper())
+            board_words_lower.add(bw.word.lower())
     timings.append(str(t))
 
     # Step 2: Build board matrix
@@ -320,16 +354,23 @@ def find_best_hints(
     with timer("faiss_candidate_search") as t:
         candidate_indices = get_faiss_candidates(team_embeddings, hint_index, top_k_per_team)
 
-        # Map FAISS indices back to hint words, filtering out board words
+        # Determine vocabulary limit (for filtering by frequency rank)
+        vocab_limit = len(hint_words_order)
+        if max_vocab_size is not None:
+            vocab_limit = min(max_vocab_size, vocab_limit)
+
+        # Map FAISS indices back to hint words, filtering out board words and substrings
         candidate_hint_words = []
         candidate_hint_vectors = []
         for idx in candidate_indices:
-            if idx < len(hint_words_order):
+            # Filter by frequency rank (idx < vocab_limit means word is in top N)
+            if idx < vocab_limit:
                 word = hint_words_order[idx]
                 if word.lower() not in excluded_words and word.upper() not in excluded_words:
-                    if word in hint_embeddings:
-                        candidate_hint_words.append(word)
-                        candidate_hint_vectors.append(hint_embeddings[word])
+                    if not contains_board_word_substring(word, board_words_lower):
+                        if word in hint_embeddings:
+                            candidate_hint_words.append(word)
+                            candidate_hint_vectors.append(hint_embeddings[word])
     timings.append(str(t))
 
     # Step 6: Build candidate matrix

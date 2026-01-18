@@ -8,6 +8,7 @@ Usage:
 import random
 from pathlib import Path
 
+import numpy as np
 import streamlit as st
 
 from Scripts.find_best_word import (
@@ -52,32 +53,73 @@ def load_codenames_words() -> list[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+def compute_hint_similarities(
+    hint_word: str,
+    board: list[BoardWord],
+    hint_embeddings: dict[str, np.ndarray],
+    board_embeddings: dict[str, np.ndarray],
+) -> dict[str, float]:
+    """
+    Compute cosine similarity between a hint word and all board words.
+
+    Args:
+        hint_word: The selected hint word
+        board: List of board words
+        hint_embeddings: Dict of hint word -> embedding
+        board_embeddings: Dict of board word -> embedding
+
+    Returns:
+        Dict mapping board word -> similarity score
+    """
+    similarities: dict[str, float] = {}
+
+    # Get hint embedding
+    hint_emb = hint_embeddings.get(hint_word.lower())
+    if hint_emb is None:
+        return similarities
+
+    for bw in board:
+        # Try different case variations for board word
+        board_emb = None
+        for variant in [bw.word.upper(), bw.word.lower(), bw.word]:
+            if variant in board_embeddings:
+                board_emb = board_embeddings[variant]
+                break
+
+        if board_emb is not None:
+            # Cosine similarity (embeddings are already normalized)
+            sim = float(np.dot(hint_emb, board_emb))
+            similarities[bw.word] = sim
+
+    return similarities
+
+
 def generate_board(words: list[str], user_team: str) -> list[BoardWord]:
     """
-    Generate a random 20-word board.
+    Generate a random 25-word board (5x5 grid).
 
     Distribution:
     - 9 team words (user's team)
     - 8 enemy words
-    - 2 neutral words
+    - 7 neutral words
     - 1 trap (assassin) word
     """
-    if len(words) < 20:
-        st.error(f"Not enough words in list ({len(words)}). Need at least 20.")
+    if len(words) < 25:
+        st.error(f"Not enough words in list ({len(words)}). Need at least 25.")
         return []
 
-    selected = random.sample(words, 20)
+    selected = random.sample(words, 25)
     random.shuffle(selected)
 
     board: list[BoardWord] = []
 
-    # Assign categories
+    # Assign categories: 9 team, 8 enemy, 7 neutral, 1 trap
     for i, word in enumerate(selected):
         if i < 9:
             category = WordCategory.TEAM
         elif i < 17:
             category = WordCategory.ENEMY
-        elif i < 19:
+        elif i < 24:
             category = WordCategory.NEUTRAL
         else:
             category = WordCategory.TRAP
@@ -119,19 +161,38 @@ def get_card_style(category: WordCategory, user_team: str) -> str:
     """
 
 
-def display_board(board: list[BoardWord], user_team: str):
-    """Display the board as a 5x4 grid."""
+def display_board(
+    board: list[BoardWord],
+    user_team: str,
+    similarities: dict[str, float] | None = None,
+):
+    """
+    Display the board as a 5x5 grid.
+
+    Args:
+        board: List of board words
+        user_team: Current user's team color
+        similarities: Optional dict mapping word -> similarity score (for selected hint)
+    """
     cols_per_row = 5
 
-    for row in range(4):
+    for row in range(5):
         cols = st.columns(cols_per_row)
         for col_idx, col in enumerate(cols):
             idx = row * cols_per_row + col_idx
             if idx < len(board):
                 bw = board[idx]
                 style = get_card_style(bw.category, user_team)
+
+                # Build display text with optional similarity
+                if similarities and bw.word in similarities:
+                    sim = similarities[bw.word]
+                    display_text = f"{bw.word}<br><small>({sim:.3f})</small>"
+                else:
+                    display_text = bw.word
+
                 col.markdown(
-                    f'<div style="{style}">{bw.word}</div>',
+                    f'<div style="{style}">{display_text}</div>',
                     unsafe_allow_html=True,
                 )
 
@@ -189,6 +250,21 @@ def main():
             help="Minimum similarity gap between last team word and first non-team word",
         )
 
+        # Vocabulary size selector (words are sorted by frequency in the CSV)
+        total_vocab = len(hint_embeddings)
+        vocab_options = [10_000, 25_000, 50_000, 100_000, total_vocab]
+        vocab_options = [v for v in vocab_options if v <= total_vocab]  # Filter valid options
+        if total_vocab not in vocab_options:
+            vocab_options.append(total_vocab)
+
+        vocab_size = st.select_slider(
+            "Vocabulary Size",
+            options=vocab_options,
+            value=vocab_options[-1],  # Default to all words
+            format_func=lambda x: f"{x:,}" if x < total_vocab else f"All ({x:,})",
+            help="Limit hints to top N most frequent words from vocabulary",
+        )
+
         st.markdown("---")
         st.markdown("### Legend")
         st.markdown(f"- **{'Red' if user_team == 'Red' else 'Blue'}**: Your team")
@@ -197,7 +273,7 @@ def main():
         st.markdown("- **Black**: Trap (Assassin)")
 
         st.markdown("---")
-        st.caption(f"Vocabulary: {len(hint_embeddings):,} words")
+        st.caption(f"Using top {vocab_size:,} of {total_vocab:,} words")
 
     # Main content
     if "board" not in st.session_state:
@@ -206,15 +282,7 @@ def main():
 
     board = st.session_state.board
 
-    # Display board
-    st.subheader("Board")
-    display_board(board, user_team)
-
-    st.markdown("---")
-
-    # Generate and display hints
-    st.subheader(f"Best Hints for {user_team} Team")
-
+    # Generate hints first (needed for selection)
     with st.spinner("Finding best hints..."):
         hints = find_best_hints(
             board_words=board,
@@ -224,9 +292,51 @@ def main():
             hint_words_order=hint_words_order,
             cliff_threshold=cliff_threshold,
             top_k=10,
+            max_vocab_size=vocab_size,
         )
 
-    display_hints(hints)
+    # Hint selection
+    selected_similarities: dict[str, float] | None = None
+    if hints:
+        st.subheader(f"Best Hints for {user_team} Team")
+
+        # Create hint options for selectbox
+        hint_options = ["(None - hide similarities)"] + [
+            f"{h.hint_word} - {h.num_words} word(s)" for h in hints
+        ]
+
+        selected_idx = st.selectbox(
+            "Select a hint to see similarities on board:",
+            range(len(hint_options)),
+            format_func=lambda i: hint_options[i],
+            key="selected_hint",
+        )
+
+        # Compute similarities for selected hint
+        if selected_idx > 0:
+            selected_hint = hints[selected_idx - 1]
+            selected_similarities = compute_hint_similarities(
+                selected_hint.hint_word,
+                board,
+                hint_embeddings,
+                codenames_embeddings,
+            )
+
+            # Show hint details
+            st.markdown(f"**Cliff size:** {selected_hint.cliff_size:.3f}")
+            st.markdown(f"**Covers:** {', '.join(selected_hint.team_words)}")
+
+    st.markdown("---")
+
+    # Display board with optional similarities
+    st.subheader("Board")
+    display_board(board, user_team, selected_similarities)
+
+    # Show all hints in expanders below
+    if hints:
+        st.markdown("---")
+        st.subheader("All Hints")
+        display_hints(hints)
 
 
 if __name__ == "__main__":
